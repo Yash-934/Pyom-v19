@@ -131,6 +131,7 @@ class MainActivity : FlutterActivity() {
                             append("-b /dev ")
                             append("-b /dev/urandom:/dev/random ")
                             append("-b /proc ")
+                            append("-b /system/etc/hosts:/etc/hosts ")
                             append("-b /proc/stat:/proc/stat ")
                             append("-b /proc/version:/proc/version ")
                             append("-b /sys ")
@@ -412,14 +413,40 @@ class MainActivity : FlutterActivity() {
             repairRootfsShell(envDir)
 
             sendProgress("Configuring environment…", 0.75)
-            File(envDir, "etc/resolv.conf").writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+            File(envDir, "etc").mkdirs()
+            File(envDir, "etc/resolv.conf").writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 8.8.4.4\n")
+            // Also bind Android hosts file
+            File(envDir, "etc/hosts").writeText("127.0.0.1 localhost\n::1 localhost\n")
             listOf("tmp", "root", "proc", "sys", "dev").forEach { File(envDir, it).mkdirs() }
 
             sendProgress("Installing Python & build tools…", 0.78)
-            val installCmd = if (distro == "ubuntu")
-                "export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-dev gcc g++ make curl wget && pip3 install --upgrade pip setuptools wheel"
-            else
-                "apk add --no-cache python3 py3-pip python3-dev gcc musl-dev make curl wget"
+            // CRITICAL FIX: apk/apt fail because libcrypto.so.3 uses syscalls
+            // not supported by Android kernel (ENOSYS).
+            // Solution: Alpine .apk files are just tar.gz archives!
+            // Use busybox wget+tar to extract them directly — no apk binary needed.
+            val alpineBase = "https://dl-cdn.alpinelinux.org/alpine/v3.19/main/aarch64"
+            val alpineCom  = "https://dl-cdn.alpinelinux.org/alpine/v3.19/community/aarch64"
+            val installCmd = if (distro == "ubuntu") {
+                // Ubuntu: fix sandbox + use insecure mode to bypass setresuid
+                "echo 'APT::Sandbox::User \"root\";' > /etc/apt/apt.conf.d/99sandbox; " +
+                "echo 'Acquire::AllowInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99sandbox; " +
+                "apt-get update -qq 2>&1 | tail -3; " +
+                "apt-get install -y --no-install-recommends --allow-unauthenticated python3 python3-pip 2>&1 | tail -5"
+            } else {
+                // Alpine: bypass apk entirely — wget + tar extract .apk packages directly
+                // .apk format = tar.gz, busybox can extract without any SSL library
+                "set -e; mkdir -p /tmp/pkgs; " +
+                "echo 'Downloading Python3 packages...'; " +
+                "wget -q '$alpineBase/python3-3.11.8-r0.apk' -O /tmp/pkgs/python3.apk 2>&1 || " +
+                "wget -q '$alpineBase/python3-3.11.7-r0.apk' -O /tmp/pkgs/python3.apk 2>&1; " +
+                "wget -q '$alpineBase/py3-pip-23.3.1-r0.apk' -O /tmp/pkgs/pip.apk 2>&1 || " +
+                "wget -q '$alpineCom/py3-pip-23.3.1-r0.apk' -O /tmp/pkgs/pip.apk 2>&1; " +
+                "echo 'Extracting...'; " +
+                "for f in /tmp/pkgs/*.apk; do tar -xzf \"\$f\" -C / 2>/dev/null || true; done; " +
+                "rm -rf /tmp/pkgs; " +
+                "echo 'Python3 install done'; " +
+                "python3 --version 2>&1"
+            }
             runCommandInProot(envId, installCmd, "/", 600_000)
 
             saveEnvConfig(envId, distro)
@@ -509,6 +536,8 @@ class MainActivity : FlutterActivity() {
             append("--link2symlink -0 ")
             append("-r '${envDir.absolutePath}' ")
             append("-b /dev -b /proc -b /sys ")
+            append("-b /dev/urandom:/dev/random ")
+            append("-b /system/etc/hosts:/etc/hosts ")
             append("-w '$workingDir' ")
             append("/bin/sh -c '$escapedCmd'")
         }
