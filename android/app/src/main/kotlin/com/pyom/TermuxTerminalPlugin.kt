@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.inputmethod.InputMethodManager
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
@@ -40,7 +41,14 @@ class PyomTerminalPlatformView(
 
         terminalView.setTerminalViewClient(object : TerminalViewClient {
             override fun onScale(scale: Float): Float = scale
-            override fun onSingleTapUp(e: MotionEvent?) {}
+
+            override fun onSingleTapUp(e: MotionEvent?) {
+                // Show keyboard on tap
+                terminalView.requestFocus()
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.showSoftInput(terminalView, InputMethodManager.SHOW_IMPLICIT)
+            }
+
             override fun shouldBackButtonBeMappedToEscape(): Boolean = false
             override fun shouldEnforceCharBasedInput(): Boolean = true
             override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
@@ -48,7 +56,14 @@ class PyomTerminalPlatformView(
             override fun copyModeChanged(copyMode: Boolean) {}
             override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean = false
             override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
-            override fun onLongPress(event: MotionEvent?): Boolean = false
+
+            override fun onLongPress(event: MotionEvent?): Boolean {
+                // Long press = paste from clipboard
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.showSoftInput(terminalView, InputMethodManager.SHOW_FORCED)
+                return true
+            }
+
             override fun readControlKey(): Boolean = false
             override fun readAltKey(): Boolean = false
             override fun readShiftKey(): Boolean = false
@@ -70,7 +85,6 @@ class PyomTerminalPlatformView(
                     val shellPath = call.argument<String>("shellPath") ?: "/system/bin/sh"
                     val cwd       = call.argument<String>("cwd") ?: "/"
                     val env       = call.argument<List<String>>("env") ?: emptyList()
-                    // FIX: Use full args list if provided (avoids shell script files)
                     val args      = call.argument<List<String>>("args")
                     startSession(shellPath, cwd, env, args)
                     result.success(null)
@@ -94,7 +108,6 @@ class PyomTerminalPlatformView(
 
     private fun startSession(shellPath: String, cwd: String, env: List<String>, argsList: List<String>? = null) {
         session?.finishIfRunning()
-        // FIX: Use full args if provided, else fallback to [shellPath]
         val argsArray = argsList?.toTypedArray() ?: arrayOf(shellPath)
         val newSession = TerminalSession(
             shellPath, cwd, argsArray, env.toTypedArray(), 2000,
@@ -124,6 +137,11 @@ class PyomTerminalPlatformView(
         terminalView.attachSession(newSession)
         newSession.initializeEmulator(80, 24, 0, 0)
         terminalView.requestFocus()
+        // Auto-show keyboard
+        terminalView.postDelayed({
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showSoftInput(terminalView, InputMethodManager.SHOW_IMPLICIT)
+        }, 300)
     }
 
     override fun getView(): View = terminalView
