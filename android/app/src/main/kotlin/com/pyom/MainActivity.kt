@@ -401,7 +401,7 @@ class MainActivity : FlutterActivity() {
             checkNetworkOrThrow()
 
             sendProgress("Downloading $distro rootfs…", 0.10)
-            val tarFile = File(extDir, "rootfs_${envId}.tar.gz")
+            val tarFile = File(filesDir, "rootfs_${envId}.tar.gz")
             downloadWithFallback(rootfsSources[distro] ?: rootfsSources["alpine"]!!, tarFile, 0.10, 0.60)
             if (isSetupCancelled.get()) { tarFile.delete(); mainHandler.post { result.error("CANCELLED", "Cancelled", null) }; return }
 
@@ -415,39 +415,19 @@ class MainActivity : FlutterActivity() {
             sendProgress("Configuring environment…", 0.75)
             File(envDir, "etc").mkdirs()
             File(envDir, "etc/resolv.conf").writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 8.8.4.4\n")
-            // Also bind Android hosts file
             File(envDir, "etc/hosts").writeText("127.0.0.1 localhost\n::1 localhost\n")
             listOf("tmp", "root", "proc", "sys", "dev").forEach { File(envDir, it).mkdirs() }
 
-            sendProgress("Installing Python & build tools…", 0.78)
-            // CRITICAL FIX: apk/apt fail because libcrypto.so.3 uses syscalls
-            // not supported by Android kernel (ENOSYS).
-            // Solution: Alpine .apk files are just tar.gz archives!
-            // Use busybox wget+tar to extract them directly — no apk binary needed.
-            val alpineBase = "https://dl-cdn.alpinelinux.org/alpine/v3.19/main/aarch64"
-            val alpineCom  = "https://dl-cdn.alpinelinux.org/alpine/v3.19/community/aarch64"
-            val installCmd = if (distro == "ubuntu") {
-                // Ubuntu: fix sandbox + use insecure mode to bypass setresuid
-                "echo 'APT::Sandbox::User \"root\";' > /etc/apt/apt.conf.d/99sandbox; " +
-                "echo 'Acquire::AllowInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99sandbox; " +
-                "apt-get update -qq 2>&1 | tail -3; " +
-                "apt-get install -y --no-install-recommends --allow-unauthenticated python3 python3-pip 2>&1 | tail -5"
+            // ── TERMUX-STYLE: Pure Java install, no apk/apt binary needed ──
+            // apk/apt FAIL on Android: libcrypto.so.3 uses syscalls blocked by kernel
+            // Alpine .apk = ZIP format → Java ZipInputStream handles directly
+            // Exactly how Termux installs bootstrap: pure Java, no shell, no proot!
+            sendProgress("📦 Downloading Python packages…", 0.78)
+            if (distro == "ubuntu") {
+                installPackagesUbuntu(envDir, envId)
             } else {
-                // Alpine: bypass apk entirely — wget + tar extract .apk packages directly
-                // .apk format = tar.gz, busybox can extract without any SSL library
-                "set -e; mkdir -p /tmp/pkgs; " +
-                "echo 'Downloading Python3 packages...'; " +
-                "wget -q '$alpineBase/python3-3.11.8-r0.apk' -O /tmp/pkgs/python3.apk 2>&1 || " +
-                "wget -q '$alpineBase/python3-3.11.7-r0.apk' -O /tmp/pkgs/python3.apk 2>&1; " +
-                "wget -q '$alpineBase/py3-pip-23.3.1-r0.apk' -O /tmp/pkgs/pip.apk 2>&1 || " +
-                "wget -q '$alpineCom/py3-pip-23.3.1-r0.apk' -O /tmp/pkgs/pip.apk 2>&1; " +
-                "echo 'Extracting...'; " +
-                "for f in /tmp/pkgs/*.apk; do tar -xzf \"\$f\" -C / 2>/dev/null || true; done; " +
-                "rm -rf /tmp/pkgs; " +
-                "echo 'Python3 install done'; " +
-                "python3 --version 2>&1"
+                installPackagesAlpineJava(envDir)
             }
-            runCommandInProot(envId, installCmd, "/", 600_000)
 
             saveEnvConfig(envId, distro)
             sendProgress("✅ Environment ready!", 1.0)
@@ -457,6 +437,110 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    // ── ALPINE: Pure Java installer (Termux-style) ──────────────────────────
+    private fun installPackagesAlpineJava(envDir: File) {
+        val base = "https://dl-cdn.alpinelinux.org/alpine/v3.19"
+        // Packages in dependency order
+        val packages = listOf(
+            "$base/main/aarch64/musl-1.2.4_git20230717-r4.apk",
+            "$base/main/aarch64/zlib-1.3.1-r0.apk",
+            "$base/main/aarch64/libgcc-13.2.1_git20231014-r0.apk",
+            "$base/main/aarch64/libstdc++-13.2.1_git20231014-r0.apk",
+            "$base/main/aarch64/openssl-3.1.4-r5.apk",
+            "$base/main/aarch64/ca-certificates-20230506-r0.apk",
+            "$base/main/aarch64/python3-3.11.8-r0.apk",
+            "$base/main/aarch64/python3-pyc-3.11.8-r0.apk",
+            "$base/community/aarch64/py3-pip-23.3.1-r0.apk",
+            "$base/community/aarch64/py3-setuptools-68.2.2-r0.apk"
+        )
+
+        packages.forEachIndexed { i, url ->
+            if (isSetupCancelled.get()) return
+            val name = url.substringAfterLast("/")
+            sendProgress("📦 $name…", 0.78 + (i.toDouble() / packages.size) * 0.18)
+            try {
+                val tmp = File(filesDir, "pkg_tmp_$i.apk")
+                try {
+                    downloadSingleFile(url, tmp)
+                    extractApkZip(tmp, envDir)
+                } finally { tmp.delete() }
+            } catch (e: Exception) {
+                android.util.Log.w("PyomSetup", "Skip $name: ${e.message}")
+            }
+        }
+        createPythonSymlinks(envDir)
+    }
+
+    private fun downloadSingleFile(url: String, dest: File) {
+        val client = OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .build()
+        val req = Request.Builder().url(url).build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw Exception("HTTP ${resp.code}")
+            resp.body!!.byteStream().use { i -> FileOutputStream(dest).use { o -> i.copyTo(o) } }
+        }
+    }
+
+    private fun extractApkZip(apkFile: File, destDir: File) {
+        // Alpine .apk = ZIP archive containing actual files (usr/bin/python3, etc.)
+        try {
+            java.util.zip.ZipInputStream(apkFile.inputStream().buffered()).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    val name = entry.name
+                    if (!name.startsWith(".") && !entry.isDirectory) {
+                        val out = File(destDir, name)
+                        out.parentFile?.mkdirs()
+                        FileOutputStream(out).use { o -> zip.copyTo(o) }
+                        if (name.startsWith("usr/bin/") || name.startsWith("bin/") ||
+                            name.startsWith("usr/sbin/") || name.startsWith("sbin/")) {
+                            out.setExecutable(true, false)
+                        }
+                    }
+                    zip.closeEntry()
+                    entry = zip.nextEntry
+                }
+            }
+        } catch (_: Exception) {
+            // Fallback: some apk might be tar.gz
+            try { extractTarGz(apkFile, destDir) } catch (_: Exception) {}
+        }
+    }
+
+    private fun createPythonSymlinks(envDir: File) {
+        // Like Termux's Os.symlink() — create symlinks via Java, no shell needed
+        val symlinks = mapOf(
+            "usr/bin/python3" to "python3.11",
+            "usr/bin/python" to "python3",
+            "usr/bin/pip" to "pip3",
+            "bin/python3" to "../usr/bin/python3",
+            "bin/python" to "../usr/bin/python3",
+            "bin/pip" to "../usr/bin/pip3",
+            "bin/pip3" to "../usr/bin/pip3"
+        )
+        symlinks.forEach { (link, target) ->
+            try {
+                val f = File(envDir, link)
+                f.parentFile?.mkdirs()
+                if (!f.exists() && !java.nio.file.Files.isSymbolicLink(f.toPath())) {
+                    android.system.Os.symlink(target, f.absolutePath)
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun installPackagesUbuntu(envDir: File, envId: String) {
+        val aptConf = File(envDir, "etc/apt/apt.conf.d")
+        aptConf.mkdirs()
+        File(aptConf, "99sandbox").writeText(
+            "APT::Sandbox::User \"root\";\nAcquire::AllowInsecureRepositories \"true\";\nAcquire::Check-Valid-Until \"false\";\n"
+        )
+        val cmd = "apt-get update -qq 2>&1 | grep -v '^W:' | tail -5; " +
+            "apt-get install -y --no-install-recommends --allow-unauthenticated python3 python3-pip 2>&1 | tail -10"
+        runCommandInProot(envId, cmd, "/", 600_000)
+    }
     private fun saveEnvConfig(envId: String, distro: String) {
         try {
             envConfigFile.writeText("""{"envId": "$envId", "distro": "$distro", "installedAt": ${System.currentTimeMillis()}}""")
