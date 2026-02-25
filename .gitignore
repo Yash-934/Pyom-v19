@@ -1,0 +1,34 @@
+
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+
+# IntelliJ
+.idea/
+*.iml
+*.ipr
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+.metadata
+.packages
+
+# Android
+android/app/src/main/assets/proot-arm
+android/app/src/main/assets/proot-arm64
+android/app/src/main/assets/proot-x86
+android/app/src/main/assets/proot-x86_64
+
+# iOS
+ios/Pods/
+ios/Podfile.lock
