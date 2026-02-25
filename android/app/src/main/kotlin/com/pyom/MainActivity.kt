@@ -126,6 +126,7 @@ class MainActivity : FlutterActivity() {
                             append("export LD_PRELOAD=; ")
                             append("exec '${prootBin.absolutePath}' ")
                             append("--link2symlink ")
+                            append("--link2symlink ")
                             append("-0 ")
                             append("-r '${envDir.absolutePath}' ")
                             append("-b /dev ")
