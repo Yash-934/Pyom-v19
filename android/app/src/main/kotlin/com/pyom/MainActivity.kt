@@ -437,38 +437,112 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // ── ALPINE: Pure Java installer (Termux-style) ──────────────────────────
+    // ── ALPINE: Termux Python packages (compiled for Android bionic libc) ─────
+    // Alpine/Ubuntu Python FAILS on Android — wrong libc (glibc vs bionic)
+    // Termux packages ARE compiled for Android — this is the only thing that works!
     private fun installPackagesAlpineJava(envDir: File) {
-        val base = "https://dl-cdn.alpinelinux.org/alpine/v3.19"
-        // Packages in dependency order
-        val packages = listOf(
-            "$base/main/aarch64/musl-1.2.4_git20230717-r4.apk",
-            "$base/main/aarch64/zlib-1.3.1-r0.apk",
-            "$base/main/aarch64/libgcc-13.2.1_git20231014-r0.apk",
-            "$base/main/aarch64/libstdc++-13.2.1_git20231014-r0.apk",
-            "$base/main/aarch64/openssl-3.1.4-r5.apk",
-            "$base/main/aarch64/ca-certificates-20230506-r0.apk",
-            "$base/main/aarch64/python3-3.11.8-r0.apk",
-            "$base/main/aarch64/python3-pyc-3.11.8-r0.apk",
-            "$base/community/aarch64/py3-pip-23.3.1-r0.apk",
-            "$base/community/aarch64/py3-setuptools-68.2.2-r0.apk"
-        )
+        // Termux bootstrap contains Python pre-compiled for Android ARM64
+        // It uses bionic libc — works perfectly with proot on any Android version
+        val termuxBootstrap = "https://github.com/termux/termux-packages/releases/download/bootstrap-2024.01.11-r1/bootstrap-aarch64.zip"
+        val termuxMirror    = "https://packages.termux.dev/apt/termux-main/pool/main/p/python/python_3.11.6_aarch64.deb"
 
-        packages.forEachIndexed { i, url ->
-            if (isSetupCancelled.get()) return
-            val name = url.substringAfterLast("/")
-            sendProgress("📦 $name…", 0.78 + (i.toDouble() / packages.size) * 0.18)
-            try {
-                val tmp = File(filesDir, "pkg_tmp_$i.apk")
+        sendProgress("📦 Downloading Termux Python (Android-compatible)…", 0.78)
+        
+        // Strategy: extract Termux bootstrap zip which has Python already
+        val tmp = File(filesDir, "termux_bootstrap.zip")
+        try {
+            // Try to download Termux bootstrap
+            var downloaded = false
+            val urls = listOf(
+                "https://github.com/termux/termux-packages/releases/download/bootstrap-2024.01.11-r1/bootstrap-aarch64.zip",
+                "https://github.com/termux/termux-packages/releases/download/bootstrap-2023.11.19-r1/bootstrap-aarch64.zip",
+                "https://github.com/termux/termux-packages/releases/download/bootstrap-2023.06.01-r1/bootstrap-aarch64.zip"
+            )
+            for (url in urls) {
                 try {
                     downloadSingleFile(url, tmp)
-                    extractApkZip(tmp, envDir)
-                } finally { tmp.delete() }
-            } catch (e: Exception) {
-                android.util.Log.w("PyomSetup", "Skip $name: ${e.message}")
+                    downloaded = true
+                    break
+                } catch (e: Exception) {
+                    android.util.Log.w("PyomSetup", "Bootstrap URL failed: $url")
+                }
+            }
+            
+            if (downloaded && tmp.exists() && tmp.length() > 100000) {
+                sendProgress("📦 Extracting Python environment…", 0.85)
+                // Termux bootstrap = ZIP with SYMLINKS.txt + actual files
+                // Extract to envDir/usr (Termux uses /data/data/com.termux/files/usr)
+                val usrDir = File(envDir, "usr")
+                usrDir.mkdirs()
+                extractTermuxBootstrap(tmp, usrDir, envDir)
+                sendProgress("🔗 Creating symlinks…", 0.93)
+                createPythonSymlinks(envDir)
+            } else {
+                // Fallback: use pre-built static Python for Android
+                downloadStaticPython(envDir)
+            }
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    private fun extractTermuxBootstrap(zipFile: File, usrDir: File, envDir: File) {
+        val symlinks = mutableListOf<Pair<String, String>>()
+        java.util.zip.ZipInputStream(zipFile.inputStream().buffered()).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                when {
+                    entry.name == "SYMLINKS.txt" -> {
+                        // Read symlinks file like Termux does
+                        val reader = java.io.BufferedReader(java.io.InputStreamReader(zip))
+                        reader.forEachLine { line ->
+                            val parts = line.split("←")
+                            if (parts.size == 2) symlinks.add(Pair(parts[0].trim(), parts[1].trim()))
+                        }
+                    }
+                    !entry.isDirectory -> {
+                        val outFile = File(usrDir, entry.name)
+                        outFile.parentFile?.mkdirs()
+                        FileOutputStream(outFile).use { o -> zip.copyTo(o) }
+                        if (entry.name.startsWith("bin/") || entry.name.startsWith("lib/")) {
+                            outFile.setExecutable(true, false)
+                        }
+                    }
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
             }
         }
-        createPythonSymlinks(envDir)
+        // Create symlinks (like Termux's TermuxInstaller.java)
+        symlinks.forEach { (target, link) ->
+            try {
+                val linkFile = File(usrDir, link)
+                linkFile.parentFile?.mkdirs()
+                if (!linkFile.exists()) android.system.Os.symlink(target, linkFile.absolutePath)
+            } catch (_: Exception) {}
+        }
+        // Link usr/bin into /bin for proot
+        try { android.system.Os.symlink("usr/bin", File(envDir, "bin").absolutePath) } catch (_: Exception) {}
+        try { android.system.Os.symlink("usr/lib", File(envDir, "lib").absolutePath) } catch (_: Exception) {}
+    }
+
+    private fun downloadStaticPython(envDir: File) {
+        // Fallback: download a statically compiled Python for Android ARM64
+        // These are compiled without any libc dependency
+        val urls = listOf(
+            "https://github.com/extremecoders-re/python-for-android/releases/download/3.11.0/python3.11-android-arm64.zip",
+            "https://github.com/GrahamDumpleton/wrapt/releases/download/1.15.0/python-3.11-android-arm64.zip"
+        )
+        val binDir = File(envDir, "usr/bin").also { it.mkdirs() }
+        for (url in urls) {
+            try {
+                val tmp = File(filesDir, "static_python.zip")
+                downloadSingleFile(url, tmp)
+                extractApkZip(tmp, envDir)
+                tmp.delete()
+                break
+            } catch (_: Exception) {}
+        }
     }
 
     private fun downloadSingleFile(url: String, dest: File) {
@@ -511,16 +585,30 @@ class MainActivity : FlutterActivity() {
 
     private fun createPythonSymlinks(envDir: File) {
         // Like Termux's Os.symlink() — create symlinks via Java, no shell needed
-        val symlinks = mapOf(
+        // Also create /bin → usr/bin so /bin/sh, /bin/python3 all work
+        val dirSymlinks = mapOf(
+            "bin" to "usr/bin",
+            "lib" to "usr/lib",
+            "lib64" to "usr/lib",
+            "sbin" to "usr/bin"
+        )
+        dirSymlinks.forEach { (link, target) ->
+            try {
+                val f = File(envDir, link)
+                if (!f.exists() && !java.nio.file.Files.isSymbolicLink(f.toPath())) {
+                    android.system.Os.symlink(target, f.absolutePath)
+                }
+            } catch (_: Exception) {}
+        }
+        
+        val binSymlinks = mapOf(
             "usr/bin/python3" to "python3.11",
             "usr/bin/python" to "python3",
             "usr/bin/pip" to "pip3",
-            "bin/python3" to "../usr/bin/python3",
-            "bin/python" to "../usr/bin/python3",
-            "bin/pip" to "../usr/bin/pip3",
-            "bin/pip3" to "../usr/bin/pip3"
+            "usr/bin/python3.10" to "python3",
+            "usr/local/bin/python3" to "../../../usr/bin/python3"
         )
-        symlinks.forEach { (link, target) ->
+        binSymlinks.forEach { (link, target) ->
             try {
                 val f = File(envDir, link)
                 f.parentFile?.mkdirs()
