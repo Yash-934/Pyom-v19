@@ -132,8 +132,6 @@ class MainActivity : FlutterActivity() {
                             append("-b /dev/urandom:/dev/random ")
                             append("-b /proc ")
                             append("-b /system/etc/hosts:/etc/hosts ")
-                            append("-b /proc/stat:/proc/stat ")
-                            append("-b /proc/version:/proc/version ")
                             append("-b /sys ")
                             append("-w /root ")
                             append("/bin/sh")
@@ -446,40 +444,36 @@ class MainActivity : FlutterActivity() {
         val termuxBootstrap = "https://github.com/termux/termux-packages/releases/download/bootstrap-2024.01.11-r1/bootstrap-aarch64.zip"
         val termuxMirror    = "https://packages.termux.dev/apt/termux-main/pool/main/p/python/python_3.11.6_aarch64.deb"
 
-        sendProgress("📦 Downloading Termux Python (Android-compatible)…", 0.78)
-        
-        // Strategy: extract Termux bootstrap zip which has Python already
+        sendProgress("📦 Downloading Python (Android-native)…", 0.78)
         val tmp = File(filesDir, "termux_bootstrap.zip")
         try {
-            // Try to download Termux bootstrap
-            var downloaded = false
+            // Termux bootstrap = ZIP with Python pre-compiled for Android bionic libc
+            // This is the ONLY Python that works on Android without root
             val urls = listOf(
                 "https://github.com/termux/termux-packages/releases/download/bootstrap-2024.01.11-r1/bootstrap-aarch64.zip",
                 "https://github.com/termux/termux-packages/releases/download/bootstrap-2023.11.19-r1/bootstrap-aarch64.zip",
-                "https://github.com/termux/termux-packages/releases/download/bootstrap-2023.06.01-r1/bootstrap-aarch64.zip"
+                "https://github.com/termux/termux-packages/releases/download/bootstrap-2023.02.18-r1/bootstrap-aarch64.zip",
+                "https://github.com/termux/termux-packages/releases/download/bootstrap-2022.12.05/bootstrap-aarch64.zip"
             )
+            var downloaded = false
             for (url in urls) {
+                if (isSetupCancelled.get()) break
                 try {
+                    sendProgress("📦 Trying: ${url.substringAfterLast("/")}", 0.79)
                     downloadSingleFile(url, tmp)
-                    downloaded = true
-                    break
+                    if (tmp.length() > 1_000_000) { downloaded = true; break }
                 } catch (e: Exception) {
-                    android.util.Log.w("PyomSetup", "Bootstrap URL failed: $url")
+                    android.util.Log.w("PyomSetup", "URL failed: $url → ${e.message}")
                 }
             }
-            
-            if (downloaded && tmp.exists() && tmp.length() > 100000) {
-                sendProgress("📦 Extracting Python environment…", 0.85)
-                // Termux bootstrap = ZIP with SYMLINKS.txt + actual files
-                // Extract to envDir/usr (Termux uses /data/data/com.termux/files/usr)
-                val usrDir = File(envDir, "usr")
-                usrDir.mkdirs()
+            if (downloaded) {
+                sendProgress("📦 Extracting Python…", 0.86)
+                val usrDir = File(envDir, "usr").also { it.mkdirs() }
                 extractTermuxBootstrap(tmp, usrDir, envDir)
-                sendProgress("🔗 Creating symlinks…", 0.93)
+                sendProgress("🔗 Linking binaries…", 0.94)
                 createPythonSymlinks(envDir)
             } else {
-                // Fallback: use pre-built static Python for Android
-                downloadStaticPython(envDir)
+                throw Exception("Could not download Python. Check internet connection and try again.")
             }
         } finally {
             tmp.delete()
